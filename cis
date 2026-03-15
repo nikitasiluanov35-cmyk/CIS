@@ -1,0 +1,1623 @@
+# -*- coding: utf-8 -*-
+"""
+CIS Tool — Единый инструмент для работы с документами CIS
+==========================================================
+Операции:
+  1. Замена файлов у существующих документов
+  2. Создание новых документов
+
+Все данные берутся из одного файла cis_data.xlsx:
+  Лист «Документы»   — список документов (Number, Дата)
+  Лист «Схемы»       — маппинг: шаблон → тип документа
+  Лист «Организации» — маппинг: шаблон → организация
+  Лист «Отчёт»       — результаты (заполняется автоматически)
+
+Запуск: python cis_tool.py
+"""
+
+# ── Версия скрипта — увеличивайте при каждом обновлении ──────────────────
+VERSION = "1.0.0"
+
+# ── Ссылка на raw-файл в вашем GitHub репозитории ────────────────────────
+# Замените на свой репозиторий после создания:
+#   https://raw.githubusercontent.com/ВАШ_НИК/ВАШ_РЕПО/main/cis_tool.py
+GITHUB_RAW_URL = "https://raw.githubusercontent.com/nikitasiluanov35-cmyk/CIS/refs/heads/main/cis_tool_1.py"   # <-- ВСТАВЬТЕ ССЫЛКУ
+
+import re
+import sys
+import json
+import datetime
+import mimetypes
+import logging
+import threading
+from pathlib import Path
+from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+try:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+except ImportError:
+    sys.exit("Установите: pip install requests openpyxl")
+
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+# ════════════════════════════════════════════════════════════════
+#  КОНФИГУРАЦИЯ — изменяйте только этот блок
+# ════════════════════════════════════════════════════════════════
+
+AUTH_URL = "https://auth.bccipmt.com/api/auth/login"
+BACKEND  = "https://documents.bccipmt.com/api"
+BACKEND2 = "https://backend.bccipmt.com/api"
+
+USERNAME = "Н.Силуянов"
+PASSWORD = "I0pOZ53!XPx–"
+
+FILES_FOLDER  = r"C:\Users\User\Desktop\Цис пайтон\Заключки"
+CIS_DATA_FILE = r"C:\Users\User\Desktop\Цис пайтон\cis_data.xlsx"
+TOKEN_FILE    = r"C:\Users\User\Desktop\Цис пайтон\cis_token.json"
+
+DOC_COLUMN = "Number"
+
+DOCUMENT_SCHEMA_DEFAULT = "Протокол визуального и (или) измерительного контроля"
+ORGANIZATION_DEFAULT    = 'ООО "НГС-ЭКСПЕР"'
+
+# Резервные маппинги — используются если листы в cis_data.xlsx пустые
+SCHEMA_MAP: dict[str, str] = {
+    "-VT-": "Заключение по контролю качества сварных соединений металлоконструкций визуальным и измерительным методом",
+    "-RT-": "Заключение по контролю качества сварных соединений радиографических методом",
+    "-PT-": "Заключение по контролю качества сварных соединений капиллярным методом",
+    "-UT-": "Заключение по контролю качества сварных соединений ультразвуковым методом",
+    "-MT-": "Заключение по контролю качества сварных соединений магнитопорошковым методом",
+}
+ORG_MAP: dict[str, str] = {
+    "NGS-VT": 'ООО "НГС-ЭКСПЕР"',
+    "NGS-RT": 'ООО "НГС-ЭКСПЕР"',
+    "NGS-PT": 'ООО "НГС-ЭКСПЕР"',
+    "NGS-UT": 'ООО "НГС-ЭКСПЕР"',
+    "NGS-MT": 'ООО "НГС-ЭКСПЕР"',
+    "NGS":    'ООО "НГС-ЭКСПЕР"',
+}
+
+# Количество параллельных потоков (проверено на сервере).
+# Можно увеличить если сервер справляется.
+WORKERS: int = 0   # 0 = автоопределение. Задать вручную: WORKERS = 16
+
+# ════════════════════════════════════════════════════════════════
+
+
+# ─────────────────────────────────────────────────────────────
+#  ЛОГИРОВАНИЕ
+# ─────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("cis_tool.log", encoding="utf-8"),
+    ],
+)
+log = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────
+#  MIME (кэшируем результат для каждого расширения)
+# ─────────────────────────────────────────────────────────────
+_MIME_MAP: dict[str, str] = {
+    ".pdf":  "application/pdf",
+    ".dwg":  "application/acad",
+    ".dxf":  "application/dxf",
+    ".doc":  "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xls":  "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".png":  "image/png",
+    ".jpg":  "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".tif":  "image/tiff",
+    ".tiff": "image/tiff",
+}
+_mime_cache: dict[str, str] = {}
+
+def _mime(fp: Path) -> str:
+    ext = fp.suffix.lower()
+    if ext not in _mime_cache:
+        m, _ = mimetypes.guess_type(fp.name)
+        _mime_cache[ext] = m or _MIME_MAP.get(ext, "application/octet-stream")
+    return _mime_cache[ext]
+
+
+# ─────────────────────────────────────────────────────────────
+#  МАППИНГИ
+# ─────────────────────────────────────────────────────────────
+def _sheet_map(wb, keywords: list[str]) -> dict[str, str]:
+    ws = next(
+        (wb[n] for n in wb.sheetnames if any(k in n.lower() for k in keywords)), None
+    )
+    if not ws:
+        return {}
+    return {
+        str(row[0]).strip(): str(row[1]).strip()
+        for row in ws.iter_rows(min_row=3, values_only=True)
+        if row[0] and len(row) > 1 and row[1]
+        and str(row[0]).strip().lower() not in ("", "none")
+        and str(row[1]).strip().lower() not in ("", "none")
+    }
+
+
+def load_mappings() -> None:
+    global SCHEMA_MAP, ORG_MAP
+    p = Path(CIS_DATA_FILE)
+    if not p.exists():
+        log.warning("  %s не найден — резервные маппинги", CIS_DATA_FILE)
+        return
+    try:
+        wb = openpyxl.load_workbook(p, read_only=True, data_only=True)
+        schemas = _sheet_map(wb, ["схем", "schema"])
+        orgs    = _sheet_map(wb, ["орган", "org"])
+        wb.close()
+    except Exception as e:
+        log.error("  Не удалось открыть %s: %s", CIS_DATA_FILE, e)
+        return
+    if schemas:
+        SCHEMA_MAP = schemas
+        log.info("  Схемы: %d шаблонов", len(SCHEMA_MAP))
+    if orgs:
+        ORG_MAP = orgs
+        log.info("  Организации: %d шаблонов", len(ORG_MAP))
+    # Сбрасываем кэши resolve — они могли заполниться до загрузки маппингов
+    _schema_resolve_cache.clear()
+    _org_resolve_cache.clear()
+
+
+# Таблица замены кириллических букв которые визуально совпадают с латинскими.
+# Встречаются в именах файлов когда набирают в русской раскладке.
+_CYR_TO_LAT = str.maketrans(
+    "АВСЕНКМОРТХаеорсух",
+    "ABCEHKMOPTXaeorcyx",
+)
+
+def _norm_number(number: str) -> str:
+    """Нормализует номер: кириллица → латиница, убирает лишние пробелы."""
+    return number.translate(_CYR_TO_LAT).strip()
+
+
+# Кэш resolved значений — не пересчитываем для одинаковых номеров
+_schema_resolve_cache: dict[str, str] = {}
+_org_resolve_cache: dict[str, str]    = {}
+
+def resolve_schema(number: str) -> Optional[str]:
+    """Возвращает название схемы по номеру или None если не найдено в маппинге."""
+    if number not in _schema_resolve_cache:
+        num = _norm_number(number).upper()
+        found = next((v for k, v in SCHEMA_MAP.items() if k.upper() in num), None)
+        _schema_resolve_cache[number] = found  # type: ignore
+    return _schema_resolve_cache[number]
+
+def resolve_org(number: str) -> str:
+    if number not in _org_resolve_cache:
+        num = _norm_number(number).upper()
+        _org_resolve_cache[number] = next(
+            (v for k, v in ORG_MAP.items() if k.upper() in num),
+            ORGANIZATION_DEFAULT,
+        )
+    return _org_resolve_cache[number]
+
+
+# ─────────────────────────────────────────────────────────────
+#  ЧТЕНИЕ ЛИСТА «ДОКУМЕНТЫ»
+# ─────────────────────────────────────────────────────────────
+_DATE_FORMATS = ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%d.%m.%y")
+_EXCEL_EPOCH  = datetime.datetime(1899, 12, 30)
+
+def _parse_date(value) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, datetime.datetime):
+        return int(value.timestamp() * 1000)
+    if isinstance(value, datetime.date):
+        return int(datetime.datetime(value.year, value.month, value.day).timestamp() * 1000)
+    if isinstance(value, (int, float)):
+        if value > 1_000_000_000_000:
+            return int(value)
+        try:
+            return int((_EXCEL_EPOCH + datetime.timedelta(days=float(value))).timestamp() * 1000)
+        except Exception:
+            return None
+    s = str(value).strip()
+    for fmt in _DATE_FORMATS:
+        try:
+            return int(datetime.datetime.strptime(s, fmt).timestamp() * 1000)
+        except ValueError:
+            continue
+    return None
+
+
+def read_doc_list() -> list[dict]:
+    p = Path(CIS_DATA_FILE)
+    if not p.exists():
+        log.error("Файл не найден: %s", CIS_DATA_FILE)
+        sys.exit(1)
+    wb = openpyxl.load_workbook(p, read_only=True, data_only=True)
+    ws = next(
+        (wb[n] for n in wb.sheetnames if "докум" in n.lower() or "document" in n.lower()),
+        wb.active,
+    )
+    hdrs = [str(c.value).strip() if c.value else ""
+            for c in next(ws.iter_rows(min_row=2, max_row=2))]
+    if DOC_COLUMN not in hdrs:
+        log.error("Колонка «%s» не найдена. Есть: %s", DOC_COLUMN, [h for h in hdrs if h])
+        sys.exit(1)
+    ci_num  = hdrs.index(DOC_COLUMN)
+    ci_date = next((hdrs.index(c) for c in ("Дата", "Date", "дата") if c in hdrs), None)
+    items = [
+        {"number": num,
+         "date_ms": _parse_date(row[ci_date]) if ci_date is not None else None,
+         "fp": None}
+        for row in ws.iter_rows(min_row=3, values_only=True)
+        if (num := (str(row[ci_num]).strip() if row[ci_num] is not None else ""))
+        and num.lower() != "none"
+    ]
+    wb.close()
+    log.info("  Загружено %d документов из «%s»", len(items), ws.title)
+    return items
+
+
+# ─────────────────────────────────────────────────────────────
+#  СЕССИЯ С CONNECTION POOL И RETRY
+# ─────────────────────────────────────────────────────────────
+def _make_session(pool_size: int = 10) -> requests.Session:
+    """
+    Создаёт сессию с:
+      - увеличенным connection pool (не пересоздаём соединения)
+      - авто-retry на сетевые ошибки (не на 4xx/5xx)
+    """
+    s = requests.Session()
+    s.verify = False
+
+    retry = Retry(
+        total=3,
+        backoff_factor=0.3,
+        status_forcelist=(),       # не ретраим по статусу — только сетевые ошибки
+        allowed_methods=["GET", "POST", "PUT", "DELETE"],
+    )
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=pool_size,
+        pool_maxsize=pool_size,
+    )
+    s.mount("https://", adapter)
+    s.mount("http://",  adapter)
+
+    s.headers.update({
+        "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0",
+        "Accept":       "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+    })
+    return s
+
+
+# ─────────────────────────────────────────────────────────────
+#  АВТОРИЗАЦИЯ
+# ─────────────────────────────────────────────────────────────
+def _save_token(token: str) -> None:
+    try:
+        p = Path(TOKEN_FILE)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"token": token}), encoding="utf-8")
+    except Exception as e:
+        log.warning("  Токен не сохранён: %s", e)
+
+def _load_token() -> Optional[str]:
+    try:
+        p = Path(TOKEN_FILE)
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8")).get("token")
+    except Exception:
+        pass
+    return None
+
+def _check_token(session: requests.Session) -> bool:
+    try:
+        return session.get(f"{BACKEND2}/WorkType", timeout=8).status_code != 401
+    except Exception:
+        return False
+
+def _do_login(session: requests.Session) -> bool:
+    try:
+        r = session.post(AUTH_URL, json={"login": USERNAME, "password": PASSWORD}, timeout=15)
+        if r.status_code == 200:
+            token = r.json().get("token")
+            if token:
+                session.headers["Authorization"] = f"Bearer {token}"
+                _save_token(token)
+                return True
+            log.error("Токен не получен: %s", r.text[:150])
+        elif r.status_code == 401:
+            log.error("Неверный логин или пароль")
+        else:
+            log.error("Авторизация %d: %s", r.status_code, r.text[:150])
+    except Exception as e:
+        log.error("Сеть: %s", e)
+    return False
+
+def authorize() -> requests.Session:
+    # Главная сессия — pool_size берём с запасом (WORKERS может быть ещё 0)
+    s = _make_session(pool_size=max(WORKERS + 2, 18))
+    saved = _load_token()
+    if saved:
+        s.headers["Authorization"] = f"Bearer {saved}"
+        log.info("  Проверяю сохранённый токен...")
+        if _check_token(s):
+            log.info("✓ Авторизован по токену")
+            return s
+        log.info("  Токен устарел, логинюсь...")
+    log.info("  Авторизация → %s", AUTH_URL)
+    if _do_login(s):
+        log.info("✓ Авторизован")
+        return s
+    log.error("✗ Авторизация не удалась")
+    sys.exit(1)
+
+def _reauth(session: requests.Session, r: requests.Response) -> bool:
+    if r.status_code != 401:
+        return False
+    log.warning("  401 — обновляю токен...")
+    try:
+        Path(TOKEN_FILE).unlink(missing_ok=True)
+    except Exception:
+        pass
+    return _do_login(session)
+
+
+# ─────────────────────────────────────────────────────────────
+#  HTTP ОБЁРТКИ
+# ─────────────────────────────────────────────────────────────
+def _request(method: str, session: requests.Session, url: str, **kw) -> requests.Response:
+    fn = getattr(session, method)
+    r  = fn(url, **kw)
+    if r.status_code == 401 and _reauth(session, r):
+        r = fn(url, **kw)
+    return r
+
+def _post(s, url, **kw):   return _request("post",   s, url, **kw)
+def _get(s, url, **kw):    return _request("get",    s, url, **kw)
+
+
+# ─────────────────────────────────────────────────────────────
+#  АВТООПРЕДЕЛЕНИЕ ЧИСЛА ПОТОКОВ
+# ─────────────────────────────────────────────────────────────
+def auto_workers(session: requests.Session,
+                 schema_id: str = "",
+                 drawing_package_id: str = "") -> int:
+    """
+    Определяет оптимальное число потоков реальным тестом загрузки файлов.
+
+    Использует реальные файлы из FILES_FOLDER — тест учитывает реальный вес PDF.
+    Если файлов нет — fallback на минимальный PDF.
+    Созданные тестовые документы удаляются после теста.
+    """
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+
+    token = session.headers.get("Authorization", "")
+
+    _schema_id = schema_id or next(iter(_SCHEMA_CACHE.values()), "")
+    _pkg_id    = drawing_package_id
+    use_upload = bool(_schema_id and _pkg_id)
+
+    # Берём реальные файлы из папки — читаем несколько в память
+    _test_files: list[tuple[str, bytes, str]] = []  # (filename, bytes, mime)
+    if use_upload:
+        folder = Path(FILES_FOLDER)
+        if folder.exists():
+            real_files = sorted(
+                f for f in folder.iterdir()
+                if f.is_file() and f.suffix.lower() in _MIME_MAP
+            )[:10]  # берём до 10 файлов для ротации
+            for fp in real_files:
+                try:
+                    _test_files.append((fp.name, fp.read_bytes(), _mime(fp)))
+                except Exception:
+                    pass
+
+    if _test_files:
+        total_size = sum(len(b) for _, b, _ in _test_files)
+        avg_size   = total_size // len(_test_files)
+        log.info("  Тест: реальные файлы из папки (%d шт., средний размер %d KB)",
+                 len(_test_files), avg_size // 1024)
+    elif use_upload:
+        # Fallback — минимальный PDF
+        _MINI_PDF = (
+            b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+            b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+            b"3 0 obj<</Type/Page/MediaBox[0 0 3 3]>>endobj\n"
+            b"xref\n0 4\n0000000000 65535 f\n"
+            b"0000000009 00000 n\n0000000058 00000 n\n"
+            b"0000000115 00000 n\n"
+            b"trailer<</Size 4/Root 1 0 R>>\nstartxref\n190\n%%EOF"
+        )
+        _test_files = [("test.pdf", _MINI_PDF, "application/pdf")]
+        log.info("  Тест: файлов в папке нет, используется минимальный PDF")
+    else:
+        log.info("  Тест: GET-запросы (schema/pkg не известны)")
+
+    created_ids: list[str] = []
+    ids_lock = threading.Lock()
+
+    def _upload_one(idx: int) -> float:
+        """Отправляет один тестовый документ. Возвращает время (сек) или -1 при ошибке."""
+        s = _make_session(pool_size=2)
+        s.headers["Authorization"] = token
+
+        if use_upload:
+            # Ротируем файлы чтобы каждый поток брал разный
+            fname, fbytes, fmime = _test_files[idx % len(_test_files)]
+            number  = f"CIS-TEST-{idx:05d}"
+            now_ms  = int(_time.time() * 1000)
+            doc_meta = json.dumps({
+                "Data": {"Дата документа": now_ms, "Номер документа": number},
+                "Number": number,
+                "SchemaId": _schema_id,
+                "WorkTypes": [], "AltitudeMarks": [], "CoordinateAxis": [],
+                "RelatedFieldItems": [],
+                "Date": now_ms, "FileDescId": None,
+                "Organization": ORGANIZATION_DEFAULT,
+                "DrawingPackageIds": [_pkg_id],
+                "StartDate": None, "EndDate": None,
+                "PageCount": 1, "PageFormat": 4,
+            }, ensure_ascii=False)
+            hdrs = {k: v for k, v in s.headers.items()
+                    if k.lower() not in ("content-type", "accept")}
+            hdrs["Accept"] = "application/json, text/plain, */*"
+            t0 = _time.perf_counter()
+            try:
+                r = s.post(
+                    f"{BACKEND}/DynamicDocument",
+                    headers=hdrs,
+                    files={
+                        "Document": (None, doc_meta, "application/json"),
+                        "File":     (fname, fbytes, fmime),
+                    },
+                    verify=False, timeout=60,
+                )
+                elapsed = _time.perf_counter() - t0
+                if r.status_code in (200, 201):
+                    doc_id = r.json().get("Id") or r.json().get("id")
+                    if doc_id:
+                        with ids_lock:
+                            created_ids.append(doc_id)
+                    return elapsed
+                if r.status_code in (429, 503, 502):
+                    return -1.0
+                return elapsed
+            except Exception:
+                return -1.0
+        else:
+            t0 = _time.perf_counter()
+            try:
+                r = s.get(f"{BACKEND2}/WorkType", timeout=15)
+                elapsed = _time.perf_counter() - t0
+                return -1.0 if r.status_code in (429, 503, 502) else elapsed
+            except Exception:
+                return -1.0
+
+    def _delete_docs(ids: list[str]) -> None:
+        """Удаляет тестовые документы чтобы не засорять реестр."""
+        if not ids:
+            return
+        s = _make_session(pool_size=4)
+        s.headers["Authorization"] = token
+        for doc_id in ids:
+            try:
+                s.delete(f"{BACKEND}/DynamicDocument/{doc_id}",
+                         verify=False, timeout=10)
+            except Exception:
+                pass
+
+    def _bench(n: int) -> tuple[float, float, bool]:
+        """Запускает n параллельных запросов. Возвращает (avg_lat, rps, ok)."""
+        t_start = _time.perf_counter()
+        with _TPE(max_workers=n) as pool:
+            times = list(pool.map(_upload_one, range(n)))
+        total_time = _time.perf_counter() - t_start
+
+        good = [t for t in times if t > 0]
+        errors = len([t for t in times if t < 0])
+        avg_lat = sum(good) / len(good) if good else 99.0
+        rps     = len(good) / total_time if total_time > 0 else 0
+        ok      = errors <= n * 0.1  # допускаем до 10% ошибок
+        return avg_lat, rps, ok
+
+    log.info("  Ступенчатый тест пропускной способности...")
+
+    # Базовый замер — 1 запрос
+    base_lat, _, _ = _bench(1)
+    log.info("  Базовая латентность: %.2fс", base_lat)
+
+    best_workers = 1
+    best_rps     = 0.0
+    steps        = list(range(1, 129))   # шаг 1: от 1 до 128
+    no_gain      = 0                     # сколько шагов подряд RPS не растёт
+    PATIENCE     = 5                     # останавливаемся после 5 шагов без роста
+
+    for n in steps:
+        avg_lat, rps, ok = _bench(n)
+        degradation = avg_lat / base_lat if base_lat > 0 else 1.0
+
+        status = ""
+        if not ok:               status = "  ✗ ошибки сервера"
+        elif degradation > 8.0:  status = f"  ⚠ деградация ×{degradation:.1f}"
+
+        log.info("  %3d потоков: %.2fс | %.0f загр/с%s", n, avg_lat, rps, status)
+
+        if not ok:
+            log.info("  Сервер даёт ошибки при %d потоках — стоп", n)
+            break
+
+        if degradation > 15.0:
+            log.info("  Критическая деградация ×%.1f — стоп", degradation)
+            break
+
+        if rps > best_rps * 1.03:   # рост хотя бы на 3%
+            best_rps     = rps
+            best_workers = n
+            no_gain      = 0
+        else:
+            no_gain += 1
+            if no_gain >= PATIENCE:
+                log.info("  RPS не растёт %d шагов подряд — оптимум найден", PATIENCE)
+                break
+
+    # Удаляем все тестовые документы
+    if created_ids:
+        log.info("  Удаляю %d тестовых документов...", len(created_ids))
+        _delete_docs(created_ids)
+
+    log.info("  ✓ Оптимум: %d потоков (%.0f загр/с)", best_workers, best_rps)
+    return best_workers
+
+
+
+def _normalize(d: dict) -> dict:
+    return {k[0].upper() + k[1:]: v for k, v in d.items()}
+
+def _doc_number(doc: dict) -> str:
+    return str(doc.get("Number") or doc.get("Name") or "")
+
+def _extract_items(data) -> list:
+    if isinstance(data, list):
+        return data
+    return data.get("Items") or data.get("items") or data.get("data") or []
+
+
+# ─────────────────────────────────────────────────────────────
+#  ПОИСК РЕЕСТРА
+# ─────────────────────────────────────────────────────────────
+def find_register(session, code: int) -> dict:
+    log.info("Ищу реестр %d...", code)
+    for url, payload in [
+        (f"{BACKEND2}/Register/getByFilter", {
+            "Code": code, "PageNumber": 1, "PageSize": 25,
+            "StatusId": [], "CustomerId": [], "ContractorId": [],
+            "SubContractorId": [], "RespUserId": [], "MarkaIds": [],
+            "TitleObjectIds": [], "DocumentCategoryId": [],
+            "DocumentSubCategoryId": [], "OrderBy": "RegisterDate",
+            "IsDesc": False, "ShowOnlyActive": False,
+            "HideReviewedRegisters": False, "ShowOnlyWhereReviewRequired": False,
+        }),
+        (f"{BACKEND2}/Register/GetByFilter", {"Code": code, "PageNumber": 1, "PageSize": 25}),
+        (f"{BACKEND}/Register/getByFilter",  {"Code": code, "PageNumber": 1, "PageSize": 1}),
+    ]:
+        try:
+            r = _post(session, url, json=payload, timeout=20)
+            if r.status_code == 200:
+                items = _extract_items(r.json())
+                if items:
+                    reg = _normalize(items[0])
+                    log.info("✓ Реестр: «%s»  Id=%s", reg.get("Name"), reg.get("Id"))
+                    return reg
+        except Exception as e:
+            log.debug("  %s", e)
+    log.error("Реестр %d не найден", code)
+    sys.exit(1)
+
+
+# ─────────────────────────────────────────────────────────────
+#  ДОКУМЕНТЫ РЕЕСТРА — параллельная загрузка батчей
+# ─────────────────────────────────────────────────────────────
+_BATCH     = 100
+_PKG_CACHE: dict = {}
+_DOCS_CACHE: dict[str, list[dict]] = {}
+_DOCS_LOCK  = threading.Lock()
+
+
+def _get_ids(session, register_id: str) -> list[str]:
+    iteration_id = _PKG_CACHE.get(register_id, {}).get("CurrentIterationId", "")
+    if not iteration_id:
+        try:
+            r = _get(session, f"{BACKEND2}/Register/{register_id}", timeout=20)
+            if r.status_code == 200:
+                iteration_id = r.json().get("CurrentIterationId", "")
+        except Exception:
+            pass
+
+    if iteration_id:
+        try:
+            r = _get(session,
+                     f"{BACKEND2}/RegisterIteration/getRegisterDynamicDocuments/{iteration_id}",
+                     timeout=60)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list) and data:
+                    ids = [item.get("DynamicDocumentItem", {}).get("DynamicDocumentId", "")
+                           for item in data]
+                    ids = [i for i in ids if i and len(i) == 36]
+                    if ids:
+                        log.info("  ID получены: %d", len(ids))
+                        return ids
+        except Exception as e:
+            log.debug("  %s", e)
+
+    for url in [f"{BACKEND}/DynamicDocument/getByFilter",
+                f"{BACKEND}/RegisterDynamicDocumentSet/getByFilter"]:
+        all_ids, page = [], 1
+        while True:
+            try:
+                r = _post(session, url,
+                          json={"RegisterId": register_id, "PageNumber": page, "PageSize": _BATCH},
+                          timeout=30)
+                if r.status_code != 200:
+                    break
+                data  = r.json()
+                items = _extract_items(data)
+                if not items:
+                    break
+                all_ids.extend(
+                    str(i.get("Id") or i.get("id") or "")
+                    for i in items if i.get("Id") or i.get("id")
+                )
+                total = int(data.get("TotalItems") or data.get("totalItems") or 0)
+                log.info("  ID: %d%s", len(all_ids), f"/{total}" if total else "")
+                if (total and len(all_ids) >= total) or len(items) < _BATCH:
+                    break
+                page += 1
+            except Exception:
+                break
+        if all_ids:
+            return all_ids
+    return []
+
+
+def _fetch_details_parallel(session, ids: list[str]) -> list[dict]:
+    """
+    Загружает детали документов параллельно батчами по _BATCH.
+    Использует пул потоков для одновременных запросов.
+    """
+    url     = f"{BACKEND}/DynamicDocument/GetDocumentShortListItemsByIds"
+    token   = session.headers.get("Authorization", "")
+    batches = [ids[i:i + _BATCH] for i in range(0, len(ids), _BATCH)]
+
+    results: list[dict] = [None] * len(batches)  # type: ignore
+
+    def fetch_batch(idx: int, batch: list[str]) -> tuple[int, list[dict]]:
+        s = _make_session()
+        s.headers["Authorization"] = token
+        try:
+            r = s.post(url, json=batch, timeout=30)
+            if r.status_code == 200:
+                data = r.json()
+                return idx, [_normalize(x)
+                              for x in (data if isinstance(data, list)
+                                        else (data.get("Items") or []))]
+        except Exception as e:
+            log.debug("  батч %d: %s", idx, e)
+        return idx, []
+
+    workers = min(len(batches), WORKERS)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fetch_batch, i, b): i for i, b in enumerate(batches)}
+        for future in as_completed(futures):
+            try:
+                idx, batch_result = future.result()
+                results[idx] = batch_result
+            except Exception:
+                results[futures[future]] = []
+
+    return [doc for batch in results if batch for doc in batch]
+
+
+def _get_or_load_docs(session, reg_id: str) -> list[dict]:
+    if reg_id in _DOCS_CACHE:
+        return _DOCS_CACHE[reg_id]
+    with _DOCS_LOCK:
+        if reg_id not in _DOCS_CACHE:
+            log.info("  Загружаю документы реестра (параллельно)...")
+            ids  = _get_ids(session, reg_id)
+            docs = _fetch_details_parallel(session, ids) if ids else []
+            # Индекс по номеру для O(1) поиска
+            _DOCS_CACHE[reg_id] = docs
+            log.info("  Документов: %d", len(docs))
+        return _DOCS_CACHE[reg_id]
+
+
+# Индекс number.lower() → doc для мгновенного поиска
+_DOCS_INDEX: dict[str, dict[str, dict]] = {}
+_INDEX_LOCK = threading.Lock()
+
+def _get_docs_index(session, reg_id: str) -> dict[str, dict]:
+    if reg_id not in _DOCS_INDEX:
+        with _INDEX_LOCK:
+            if reg_id not in _DOCS_INDEX:
+                docs = _get_or_load_docs(session, reg_id)
+                _DOCS_INDEX[reg_id] = {_doc_number(d).lower(): d for d in docs}
+    return _DOCS_INDEX[reg_id]
+
+
+def find_doc_by_number(session, reg_id: str, number: str) -> Optional[dict]:
+    """O(1) поиск по предварительно построенному индексу."""
+    return _get_docs_index(session, reg_id).get(number.strip().lower())
+
+
+# Кэш поиска файлов в папке — строим один раз
+_FILES_INDEX: dict[str, dict[str, Path]] = {}   # folder → {name_lower: path}
+_FILES_LOCK  = threading.Lock()
+
+def _get_files_index(folder: str) -> dict[str, Path]:
+    if folder not in _FILES_INDEX:
+        with _FILES_LOCK:
+            if folder not in _FILES_INDEX:
+                p = Path(folder)
+                idx: dict[str, Path] = {}
+                if p.exists():
+                    for f in p.iterdir():
+                        if f.is_file():
+                            idx[f.name.lower()] = f
+                _FILES_INDEX[folder] = idx
+    return _FILES_INDEX[folder]
+
+def find_local_file(number: str, folder: str = FILES_FOLDER) -> Optional[Path]:
+    """Ищет файл по номеру в предварительно проиндексированной папке."""
+    idx     = _get_files_index(folder)
+    pattern = re.compile(re.escape(number), re.I)
+    return next((path for name, path in idx.items() if pattern.search(name)), None)
+
+
+# ─────────────────────────────────────────────────────────────
+#  ОПЕРАЦИЯ 1: ЗАМЕНА ФАЙЛА
+# ─────────────────────────────────────────────────────────────
+def _upload_hdrs(session) -> dict:
+    return {k: v for k, v in session.headers.items() if k.lower() != "content-type"}
+
+def replace_file(session, doc: dict, new_file: Path) -> tuple[bool, str]:
+    """Заменяет файл у существующего документа."""
+    short_id = doc.get("Id", "")
+    if not short_id:
+        return False, "Нет Id документа"
+
+    # _get_full_doc нужен — как в рабочей версии
+    full    = _get_full_doc(session, short_id)
+    real_id = (full or {}).get("Id") or short_id
+    url     = f"{BACKEND}/DynamicDocument/Upload"
+    hdrs    = _upload_hdrs(session)
+
+    for attempt in range(2):
+        try:
+            with open(new_file, "rb") as fh:
+                r = requests.post(
+                    url,
+                    params={"id": real_id},
+                    files={"File": (new_file.name, fh, _mime(new_file))},
+                    headers=hdrs, verify=False, timeout=120,
+                )
+            if r.status_code == 401 and attempt == 0 and _reauth(session, r):
+                hdrs = _upload_hdrs(session)
+                continue
+            if r.status_code in (200, 201, 204):
+                log.info("  ✓ Файл заменён [%d]", r.status_code)
+                return True, f"Файл: {new_file.name}"
+            log.error("  Upload %d: %s", r.status_code, r.text[:200])
+            return False, f"Upload ошибка {r.status_code}"
+        except Exception as e:
+            return False, f"Exception: {e}"
+    return False, "Не удалось загрузить"
+
+
+# ─────────────────────────────────────────────────────────────
+#  ОПЕРАЦИЯ 2: СОЗДАНИЕ ДОКУМЕНТА
+# ─────────────────────────────────────────────────────────────
+_SCHEMA_CACHE: dict[str, str] = {}
+_SCHEMA_LOCK  = threading.Lock()
+
+
+def _paginate_schemas(session, payload: dict) -> list[dict]:
+    result = []
+    for skip in range(0, 1000, 20):
+        try:
+            r = session.post(
+                f"{BACKEND}/DocumentSchema/getItems",
+                json={**payload, "Skip": skip, "Top": 20},
+                timeout=15,
+            )
+            if r.status_code != 200:
+                break
+            page = r.json() or []
+            result.extend(page)
+            if len(page) < 20:
+                break
+        except Exception:
+            break
+    return result
+
+
+def _collect_all_schemas(session) -> list[dict]:
+    """Параллельно загружает схемы по всем категориям."""
+    all_schemas: dict[str, dict] = {}
+
+    def _add(schemas: list) -> None:
+        for s in schemas:
+            sid = s.get("Id") or s.get("id")
+            if sid and (s.get("Title") or s.get("title")):
+                all_schemas[sid] = s
+
+    # Получаем категории
+    categories = []
+    try:
+        r = session.get(f"{BACKEND}/documentCategory", timeout=15)
+        if r.status_code == 200:
+            categories = r.json() if isinstance(r.json(), list) else []
+            log.info("  Категорий: %d", len(categories))
+    except Exception as e:
+        log.debug("  documentCategory: %s", e)
+
+    # Параллельно загружаем схемы по каждой категории
+    def fetch_cat(cat):
+        cat_id = cat.get("Id") or cat.get("id")
+        if not cat_id:
+            return []
+        return _paginate_schemas(session, {"CategoryId": cat_id, "ShowOnlyActive": True})
+
+    with ThreadPoolExecutor(max_workers=min(len(categories) or 1, 8)) as pool:
+        for schemas in pool.map(fetch_cat, categories):
+            _add(schemas)
+
+    # Запасной: без категории
+    _add(_paginate_schemas(session, {"ShowOnlyActive": True}))
+
+    # GetGenerateDocumentSchemaIds
+    try:
+        r = session.get(f"{BACKEND}/DocumentSchema/GetGenerateDocumentSchemaIds", timeout=15)
+        if r.status_code == 200:
+            missing = [sid for sid in (r.json() or []) if sid not in all_schemas]
+
+            def fetch_schema(sid):
+                try:
+                    r2 = session.get(f"{BACKEND}/DocumentSchema/{sid}", timeout=15)
+                    if r2.status_code == 200:
+                        return r2.json()
+                except Exception:
+                    pass
+                return None
+
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                for s in pool.map(fetch_schema, missing):
+                    if s and s.get("Id") and (s.get("Title") or s.get("title")):
+                        all_schemas[s["Id"]] = s
+    except Exception:
+        pass
+
+    result = [s for s in all_schemas.values() if s.get("Title") or s.get("title")]
+    log.info("  Схем найдено: %d", len(result))
+    return result
+
+
+def get_schema_id(session, title: str) -> str:
+    """Потокобезопасный поиск SchemaId с кэшированием."""
+    # Нормализуем ключ кэша
+    title = title.replace("\xa0", " ").replace("\u00a0", " ").strip()
+
+    if title in _SCHEMA_CACHE:
+        return _SCHEMA_CACHE[title]
+
+    with _SCHEMA_LOCK:
+        if title in _SCHEMA_CACHE:   # double-check
+            return _SCHEMA_CACHE[title]
+
+        log.info("  Ищу схему: «%s»...", title[:60])
+        all_schemas = _collect_all_schemas(session)
+
+        # Нормализуем \xa0 (неразрывный пробел) с обеих сторон перед сравнением
+        def _norm(t: str) -> str:
+            return t.replace("\xa0", " ").replace("\u00a0", " ").strip().lower()
+
+        title_lower = _norm(title)
+        exact   = next((s for s in all_schemas
+                        if _norm(s.get("Title") or "") == title_lower), None)
+        partial = [s for s in all_schemas
+                   if title_lower in _norm(s.get("Title") or "")]
+
+        match = exact or (partial[0] if partial else None)
+        if match:
+            sid = match.get("Id") or match.get("id")
+            _SCHEMA_CACHE[title] = sid
+            if not exact and len(partial) > 1:
+                log.warning("  Несколько совпадений, берём: «%s»", match.get("Title"))
+            else:
+                log.info("  ✓ Схема: «%s»", match.get("Title"))
+            return sid
+
+        log.error("✗ Схема «%s» не найдена. Доступные:", title)
+        for s in sorted(all_schemas, key=lambda x: x.get("Title") or ""):
+            if t := s.get("Title"):
+                log.error("    «%s»", t)
+        sys.exit(1)
+
+
+def get_drawing_package_id(session, register_id: str) -> str:
+    r = session.get(f"{BACKEND2}/Register/getPageModel/{register_id}", timeout=20)
+    if r.status_code == 200:
+        pkg_id = r.json().get("DrawingPackageId")
+        if pkg_id:
+            log.info("  DrawingPackageId: %s", pkg_id)
+            return pkg_id
+    log.error("Не удалось получить DrawingPackageId")
+    sys.exit(1)
+
+
+def create_document(
+    session,
+    number: str,
+    schema_id: str,
+    drawing_package_id: str,
+    file_path: Path,
+    date_ms: Optional[int] = None,
+) -> tuple[bool, str]:
+    if date_ms is None:
+        date_ms = int(datetime.datetime.now().timestamp() * 1000)
+
+    organization = resolve_org(number)
+    log.info("  Создаю «%s»  Орг: %s  Дата: %s",
+             number, organization,
+             datetime.datetime.fromtimestamp(date_ms / 1000).strftime("%d.%m.%Y"))
+
+    doc_meta = {
+        "Data":              {"Дата документа": date_ms, "Номер документа": number},
+        "Number":            number,
+        "SchemaId":          schema_id,
+        "WorkTypes":         [],
+        "AltitudeMarks":     [],
+        "CoordinateAxis":    [],
+        "RelatedFieldItems": [],
+        "Date":              date_ms,
+        "FileDescId":        None,
+        "Organization":      organization,
+        "DrawingPackageIds": [drawing_package_id],
+        "StartDate":         None,
+        "EndDate":           None,
+        "PageCount":         1,
+        "PageFormat":        4,
+    }
+
+    hdrs = {k: v for k, v in session.headers.items()
+            if k.lower() not in ("content-type", "accept")}
+    hdrs["Accept"] = "application/json, text/plain, */*"
+
+    doc_meta_str = json.dumps(doc_meta, ensure_ascii=False)
+
+    for attempt in range(2):
+        try:
+            # Открываем файл заново при каждой попытке (как в рабочей версии)
+            with open(file_path, "rb") as fh:
+                r = requests.post(
+                    f"{BACKEND}/DynamicDocument",
+                    headers=hdrs,
+                    files={
+                        "Document": (None, doc_meta_str, "application/json"),
+                        "File":     (file_path.name, fh, _mime(file_path)),
+                    },
+                    verify=False, timeout=120,
+                )
+            if r.status_code == 401 and attempt == 0 and _reauth(session, r):
+                hdrs["Authorization"] = session.headers.get("Authorization", "")
+                continue
+            if r.status_code in (200, 201):
+                doc_id = r.json().get("Id") or r.json().get("id")
+                if doc_id:
+                    log.info("  ✓ Создан Id=%s", doc_id)
+                    return True, doc_id
+                return False, "Ответ без Id"
+            log.error("  Create %d: %s", r.status_code, r.text[:400])
+            if r.status_code == 400:
+                log.error("  Отправлено: SchemaId=%s  Org=%s  DrawingPkg=%s",
+                          doc_meta.get("SchemaId","")[:8],
+                          doc_meta.get("Organization",""),
+                          (doc_meta.get("DrawingPackageIds") or [""])[0][:8])
+            return False, f"Ошибка {r.status_code}: {r.text[:200]}"
+        except Exception as e:
+            return False, f"Exception: {e}"
+    return False, "Не удалось создать"
+
+
+def add_to_register(session, register_id: str, doc_id: str) -> bool:
+    r = _post(session,
+              f"{BACKEND2}/Register/AddDynamicDocuments/{register_id}",
+              json={"documentIds": [doc_id], "copyDocumentIds": []},
+              timeout=20)
+    if r.status_code in (200, 201, 204):
+        return True
+    log.error("  AddDynamicDocuments %d: %s", r.status_code, r.text[:200])
+    return False
+
+
+# ─────────────────────────────────────────────────────────────
+#  ОТЧЁТ
+# ─────────────────────────────────────────────────────────────
+_REPORT_COLORS = {
+    "header_fill": "1F3864",
+    "note_fill":   "E2EFDA",
+    "alt_fill":    "F2F2F2",
+    "status": {
+        "✓ Успешно":   "C6EFCE",
+        "✗ Ошибка":    "FFC7CE",
+        "✗ Не найден": "FFC7CE",
+        "— Пропущен":  "FFEB9C",
+    },
+}
+
+# Преаллоцируем объекты стилей — не создаём заново для каждой ячейки
+_H_FILL  = PatternFill("solid", fgColor=_REPORT_COLORS["header_fill"])
+_H_FONT  = Font(color="FFFFFF", bold=True, size=11)
+_NOTE_F  = PatternFill("solid", fgColor=_REPORT_COLORS["note_fill"])
+_NOTE_T  = Font(color="375623", italic=True, size=9)
+_ALT_F   = PatternFill("solid", fgColor=_REPORT_COLORS["alt_fill"])
+_NO_FILL = PatternFill()
+_CENTER  = Alignment(horizontal="center", vertical="center")
+_VCENTER = Alignment(vertical="center")
+_BOLD    = Font(bold=True)
+_STATUS_FILLS = {k: PatternFill("solid", fgColor=v)
+                 for k, v in _REPORT_COLORS["status"].items()}
+
+def save_report(rows: list[dict], operation: str,
+                start_time: datetime.datetime, reg_code: int = 0) -> None:
+    if not rows:
+        return
+    p = Path(CIS_DATA_FILE)
+    if not p.exists():
+        log.error("Отчёт не сохранён: %s", CIS_DATA_FILE)
+        return
+    try:
+        wb = openpyxl.load_workbook(p)
+    except Exception as e:
+        log.error("Не удалось открыть файл: %s", e)
+        return
+
+    report_name = next(
+        (n for n in wb.sheetnames if "отч" in n.lower() or "report" in n.lower()), None
+    )
+    if report_name:
+        ws = wb[report_name]
+        ws.delete_rows(1, ws.max_row)
+    else:
+        ws = wb.create_sheet("Отчёт")
+
+    # Строка 1
+    ws.merge_cells("A1:D1")
+    ws["A1"] = (f"Операция: {operation}  |  Реестр: {reg_code}  |  "
+                f"Дата: {datetime.datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
+    ws["A1"].fill = _NOTE_F; ws["A1"].font = _NOTE_T
+    ws["A1"].alignment = _VCENTER
+    ws.row_dimensions[1].height = 20
+
+    # Строка 2 — заголовки
+    headers = ["Номер документа", "Статус", "Подробности", "Время"]
+    widths  = [30, 18, 55, 12]
+    for col, (h, w) in enumerate(zip(headers, widths), 1):
+        cell = ws.cell(row=2, column=col, value=h)
+        cell.fill = _H_FILL; cell.font = _H_FONT; cell.alignment = _CENTER
+        ws.column_dimensions[get_column_letter(col)].width = w
+    ws.row_dimensions[2].height = 20
+
+    # Данные — используем предаллоцированные объекты стилей
+    for ri, row in enumerate(rows, 3):
+        fill = _STATUS_FILLS.get(row["Статус"]) or (_ALT_F if ri % 2 == 0 else _NO_FILL)
+        for col, h in enumerate(headers, 1):
+            cell = ws.cell(row=ri, column=col, value=row[h])
+            cell.fill = fill; cell.alignment = _VCENTER
+        ws.row_dimensions[ri].height = 16
+
+    ok   = sum(1 for r in rows if r["Статус"] == "✓ Успешно")
+    fail = sum(1 for r in rows if "✗" in r["Статус"])
+    skip = sum(1 for r in rows if r["Статус"] == "— Пропущен")
+    sr   = ws.max_row + 2
+    ws.cell(row=sr, column=1, value="ИТОГО").font = _BOLD
+    ws.cell(row=sr, column=2,
+            value=f"✓ {ok}  ✗ {fail}  — {skip}  |  "
+                  f"{str(datetime.datetime.now() - start_time).split('.')[0]}").font = _BOLD
+    ws.freeze_panes = "A3"
+
+    try:
+        wb.save(p)
+        log.info("✓ Отчёт → «%s»: %s", ws.title, CIS_DATA_FILE)
+    except Exception as e:
+        log.error("Не удалось сохранить отчёт: %s", e)
+
+
+_VALID_EXT = frozenset({
+    ".pdf", ".dwg", ".dxf", ".doc", ".docx",
+    ".xls", ".xlsx", ".png", ".jpg", ".jpeg", ".tif", ".tiff",
+})
+
+
+def choose_operation() -> tuple[int, int, int, bool]:
+    """
+    Интерактивное меню. Возвращает (operation, source, register_code, keep_order).
+    operation:  1=замена, 2=создание
+    source:     1=Excel, 2=папка, 3=вручную
+    keep_order: True = сохранять порядок документов как в источнике
+    """
+    print()
+    print("╔══════════════════════════════════════════════════════════╗")
+    print("║              CIS Tool — Работа с документами            ║")
+    print("╠══════════════════════════════════════════════════════════╣")
+    print("║  ОПЕРАЦИЯ:                                               ║")
+    print("║  [1]  Замена файлов   (заменить файл у существующих)    ║")
+    print("║  [2]  Создание        (создать новые документы)         ║")
+    print("╠══════════════════════════════════════════════════════════╣")
+    print("║  ИСТОЧНИК НОМЕРОВ:                                       ║")
+    print("║  [A]  Лист «Документы» из cis_data.xlsx                 ║")
+    print("║  [B]  Папка с файлами (номер = имя файла)               ║")
+    print("║  [C]  Один номер вручную                                 ║")
+    print("╠══════════════════════════════════════════════════════════╣")
+    print("║  ПОРЯДОК ДОКУМЕНТОВ:                                     ║")
+    print("║  [Y]  Сохранять порядок (медленнее — add_to_register    ║")
+    print("║       выполняется последовательно)                       ║")
+    print("║  [N]  Без сортировки   (быстрее — полностью параллельно)║")
+    print("╠══════════════════════════════════════════════════════════╣")
+    print("║  [0]  Выход                                              ║")
+    print("╚══════════════════════════════════════════════════════════╝")
+    print()
+
+    while True:
+        code_str = input("  Введите номер книги (реестра): ").strip()
+        if code_str.isdigit():
+            break
+        print("  Номер должен быть числом, например: 51985")
+    print()
+
+    while True:
+        oper = input("  Операция [1 / 2 / 0]: ").strip()
+        if oper == "0":
+            sys.exit(0)
+        if oper in ("1", "2"):
+            break
+        print("  Введите 1, 2 или 0")
+
+    while True:
+        src = input("  Источник [A / B / C]: ").strip().upper()
+        if src in ("A", "B", "C"):
+            break
+        print("  Введите A, B или C")
+
+    while True:
+        order = input("  Сохранять порядок? [Y / N]: ").strip().upper()
+        if order in ("Y", "N"):
+            break
+        print("  Введите Y или N")
+
+    return int(oper), {"A": 1, "B": 2, "C": 3}[src], int(code_str), order == "Y"
+
+
+def get_items(source: int) -> list[dict]:
+    """Получает список документов согласно выбранному источнику."""
+    print()
+
+    if source == 1:
+        print(f"  Читаю лист «Документы» из: {CIS_DATA_FILE}")
+        items = read_doc_list()
+        if not items:
+            print("  Список пуст.")
+            sys.exit(1)
+        # Добавляем порядковый индекс
+        for i, item in enumerate(items):
+            item["_order"] = i
+        print(f"  Загружено: {len(items)} строк")
+        _preview(items)
+        print()
+        if input("  Продолжить? [Enter = да / n = нет]: ").strip().lower() == "n":
+            sys.exit(0)
+        return items
+
+    if source == 2:
+        current = FILES_FOLDER
+        print(f"  Текущая папка: {current}")
+        new_p = input("  Enter = использовать, или введите другой путь: ").strip()
+        if new_p:
+            current = new_p
+        folder = Path(current)
+        if not folder.exists():
+            print(f"  ОШИБКА: папка не найдена: {current}")
+            sys.exit(1)
+        all_files = sorted(f for f in folder.iterdir() if f.is_file())
+        files     = [f for f in all_files if f.suffix.lower() in _VALID_EXT]
+        skipped   = len(all_files) - len(files)
+        if skipped:
+            print(f"  Пропущено (неизвестное расширение): {skipped}")
+        if not files:
+            print("  Нет файлов с поддерживаемыми расширениями.")
+            sys.exit(1)
+        items = [{"number": fp.stem, "date_ms": None, "fp": fp, "_order": i}
+                 for i, fp in enumerate(files)]
+        print(f"  Файлов для обработки: {len(files)}")
+        _preview(items)
+        print()
+        if input("  Продолжить? [Enter = да / n = нет]: ").strip().lower() == "n":
+            sys.exit(0)
+        return items
+
+    # source == 3: вручную
+    number = input("  Введите номер документа: ").strip()
+    if not number:
+        print("  Номер не введён.")
+        sys.exit(0)
+    return [{"number": number, "date_ms": None, "fp": None, "_order": 0}]
+
+
+def _preview(items: list[dict], n: int = 3) -> None:
+    print("  Примеры (номер | дата | схема | организация):")
+    for it in items[:n]:
+        number = it["number"]
+        d_str  = (datetime.datetime.fromtimestamp(it["date_ms"] / 1000).strftime("%d.%m.%Y")
+                  if it.get("date_ms") else "текущая")
+        sch    = resolve_schema(number) or "⚠ нет маппинга"
+        sch    = sch[:40] + "…" if len(sch) > 40 else sch
+        print(f"    {number}  |  {d_str}  |  {sch}  |  {resolve_org(number)}")
+    if len(items) > n:
+        print(f"    ... и ещё {len(items) - n}")
+
+
+# ─────────────────────────────────────────────────────────────
+#  ГЛАВНАЯ ФУНКЦИЯ
+# ─────────────────────────────────────────────────────────────
+def main() -> None:
+    log.info("=" * 60)
+    log.info("CIS Tool")
+    log.info("=" * 60)
+
+    load_mappings()
+
+    operation, source, reg_code, keep_order = choose_operation()
+    is_create = operation == 2
+    oper_name = "Создание документов" if is_create else "Замена файлов"
+
+    session  = authorize()
+    register = find_register(session, reg_code)
+    reg_id   = register["Id"]
+    _PKG_CACHE[reg_id] = {"CurrentIterationId": register.get("CurrentIterationId", "")}
+
+    drawing_pkg_id = None
+    if is_create:
+        log.info("Получаю DrawingPackageId...")
+        drawing_pkg_id = get_drawing_package_id(session, reg_id)
+
+    # Прогрев кэшей до старта потоков
+    log.info("Подготовка...")
+    if not is_create:
+        _get_docs_index(session, reg_id)
+    _get_files_index(FILES_FOLDER)
+
+    items    = get_items(source)
+    total    = len(items)
+    rows: list[dict] = []
+    ok = fail = skip = 0
+    start_ts = datetime.datetime.now()
+
+    # Прогрев кэша схем ПОСЛЕ получения списка — знаем все уникальные типы
+    if is_create:
+        log.info("  Загружаю схемы документов (один раз для всех потоков)...")
+        # Сбрасываем resolve-кэш — он мог заполниться в _preview до load_mappings
+        _schema_resolve_cache.clear()
+        _org_resolve_cache.clear()
+
+        # Проверяем какие номера не покрыты маппингом
+        no_schema = [item["number"] for item in items if not resolve_schema(item["number"])]
+        if no_schema:
+            log.warning("  ⚠ Не найден маппинг схемы для %d документов:", len(no_schema))
+            for n in no_schema[:10]:
+                log.warning("    %s", n)
+            if len(no_schema) > 10:
+                log.warning("    ... и ещё %d", len(no_schema) - 10)
+            log.warning("  Добавьте шаблоны в лист «Схемы» файла cis_data.xlsx")
+            log.warning("  Документы без маппинга будут пропущены автоматически")
+            # Оставляем только документы с найденной схемой
+            items = [item for item in items if resolve_schema(item["number"])]
+            total = len(items)
+            log.info("  Будет обработано: %d документов", total)
+
+        unique_titles = {resolve_schema(item["number"]) for item in items}
+        log.info("  Уникальных типов схем: %d", len(unique_titles))
+        for title in unique_titles:
+            if title and title not in _SCHEMA_CACHE:
+                get_schema_id(session, title)
+        log.info("  ✓ Все схемы найдены и закэшированы")
+
+    # Автоопределение числа потоков — ПОСЛЕ прогрева схем, чтобы передать schema_id
+    global WORKERS
+    if WORKERS == 0:
+        log.info("Автоопределение числа потоков (реальный тест загрузки)...")
+        # Берём первую найденную схему и drawing_package_id для теста
+        _test_schema = next(iter(_SCHEMA_CACHE.values()), "")
+        _test_pkg    = drawing_pkg_id or ""
+        WORKERS = auto_workers(session, _test_schema, _test_pkg)
+    else:
+        log.info("Потоков (задано вручную): %d", WORKERS)
+
+    log.info("=" * 60)
+    log.info("Начинаю. %s | Реестр: %d | Документов: %d | Потоков: %d", oper_name, reg_code, total, WORKERS)
+    log.info("=" * 60)
+
+    token   = session.headers.get("Authorization", "").removeprefix("Bearer ")
+    counter = [0]
+    c_lock  = threading.Lock()
+
+    # Создаём пул сессий заранее — по одной на поток, не пересоздаём на каждый документ
+    _thread_sessions: dict[int, requests.Session] = {}
+    _sess_lock = threading.Lock()
+
+    def _get_thread_session() -> requests.Session:
+        tid = threading.get_ident()
+        if tid not in _thread_sessions:
+            with _sess_lock:
+                if tid not in _thread_sessions:
+                    ts = _make_session(pool_size=8)
+                    ts.headers["Authorization"] = f"Bearer {token}"
+                    _thread_sessions[tid] = ts
+        return _thread_sessions[tid]
+
+    def process(item: dict) -> dict:
+        number  = item["number"]
+        fp      = item.get("fp")
+        date_ms = item.get("date_ms")
+
+        # Нормализуем номер: кириллица → латиница (NGS-VТ → NGS-VT)
+        number = _norm_number(number)
+
+        ts = _get_thread_session()   # переиспользуем сессию потока
+
+        with c_lock:
+            counter[0] += 1
+            idx = counter[0]
+
+        if not is_create:
+            log.info("[%d/%d] Замена: %s", idx, total, number)
+            if fp is None:
+                fp = find_local_file(number)
+            if not fp:
+                return {"number": number, "status": "— Пропущен",
+                        "details": "Файл не найден"}
+            doc = find_doc_by_number(ts, reg_id, number)
+            if not doc:
+                log.error("  [%s] ✗ Не найден в реестре", number)
+                return {"number": number, "status": "✗ Не найден",
+                        "details": "Не найден в реестре"}
+            ok_flag, details = replace_file(ts, doc, fp)
+            if ok_flag:
+                log.info("  [%s] ✓", number)
+            else:
+                log.error("  [%s] ✗ %s", number, details)
+            return {"number": number,
+                    "status": "✓ Успешно" if ok_flag else "✗ Ошибка",
+                    "details": details}
+
+        else:
+            log.info("[%d/%d] Создание: %s", idx, total, number)
+            if fp is None:
+                fp = find_local_file(number)
+            if not fp:
+                return {"number": number, "status": "✗ Ошибка",
+                        "details": "Файл не найден", "doc_id": None}
+            schema_title = resolve_schema(number)
+            if not schema_title:
+                log.error("  [%s] ✗ Нет маппинга схемы — пропускаю", number)
+                return {"number": number, "status": "— Пропущен",
+                        "details": "Нет маппинга схемы в cis_data.xlsx", "doc_id": None}
+            schema_id = get_schema_id(ts, schema_title)
+            # Смещаем дату на index*1000мс — CIS сортирует по Date,
+            # поэтому документы встанут в реестре в нужном порядке
+            order_offset = item.get("_order", 0) * 1000
+            ok_flag, result = create_document(
+                ts, number, schema_id, drawing_pkg_id, fp,
+                (date_ms or int(datetime.datetime.now().timestamp() * 1000)) + order_offset)
+            if not ok_flag:
+                return {"number": number, "status": "✗ Ошибка",
+                        "details": result, "doc_id": None}
+            doc_id = result
+            log.info("  [%s] ✓ создан Id=%s", number, doc_id)
+
+            if not keep_order:
+                # Сразу добавляем в реестр прямо в потоке
+                if add_to_register(ts, reg_id, doc_id):
+                    fp_name = fp.name if fp else ""
+                    return {"number": number, "status": "✓ Успешно",
+                            "details": f"Id={doc_id}, файл={fp_name}", "doc_id": doc_id}
+                return {"number": number, "status": "✗ Ошибка",
+                        "details": f"Создан Id={doc_id}, не добавлен в реестр", "doc_id": doc_id}
+
+            # С сортировкой — возвращаем doc_id, в реестр добавим позже по порядку
+            return {"number": number, "status": "✓ Создан",
+                    "details": f"файл={fp.name if fp else ''}", "doc_id": doc_id}
+
+    # Параллельный запуск — создаём документы параллельно, но в реестр добавляем по порядку
+    order          = {item["number"]: i for i, item in enumerate(items)}
+    future_to_item = {}
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        # Для замены — просто запускаем параллельно
+        if not is_create:
+            futures = {pool.submit(process, item): item["number"] for item in items}
+            for future in as_completed(futures):
+                try:
+                    res = future.result()
+                except Exception as e:
+                    num = futures[future]
+                    log.error("  [%s] необработанная ошибка: %s", num, e)
+                    res = {"number": num, "status": "✗ Ошибка", "details": str(e)}
+                rows.append({
+                    "Номер документа": res["number"],
+                    "Статус":          res["status"],
+                    "Подробности":     res["details"],
+                    "Время":           datetime.datetime.now().strftime("%H:%M:%S"),
+                })
+                s = res["status"]
+                if s == "✓ Успешно":    ok   += 1
+                elif s == "— Пропущен": skip += 1
+                else:                   fail += 1
+        else:
+            futures = {pool.submit(process, item): item for item in items}
+
+            if keep_order:
+                # ── С СОРТИРОВКОЙ ───────────────────────────────────────
+                # Создание параллельно, add_to_register строго по порядку
+                log.info("  Режим: сохранение порядка (add_to_register последовательно)")
+                results_map: dict[str, dict] = {}
+                for future in as_completed(futures):
+                    item = futures[future]
+                    try:
+                        res = future.result()
+                    except Exception as e:
+                        res = {"number": item["number"], "status": "✗ Ошибка",
+                               "details": str(e), "doc_id": None}
+                    results_map[item["number"]] = res
+
+                log.info("  Добавляю в реестр по порядку...")
+                ts_main = _get_thread_session()
+                for item in items:
+                    res    = results_map.get(item["number"],
+                             {"number": item["number"], "status": "✗ Ошибка",
+                              "details": "Нет результата", "doc_id": None})
+                    doc_id = res.get("doc_id")
+                    fp     = item.get("fp") or find_local_file(item["number"])
+
+                    if res["status"] == "✓ Создан" and doc_id:
+                        if add_to_register(ts_main, reg_id, doc_id):
+                            log.info("  [%s] ✓ Id=%s", res["number"], doc_id)
+                            res["status"]  = "✓ Успешно"
+                            res["details"] = f"Id={doc_id}, файл={fp.name if fp else ''}"
+                            ok += 1
+                        else:
+                            res["status"]  = "✗ Ошибка"
+                            res["details"] = f"Создан Id={doc_id}, не добавлен в реестр"
+                            fail += 1
+                    elif res["status"] == "— Пропущен": skip += 1
+                    elif res["status"] == "✓ Успешно":  ok   += 1
+                    else:                                fail += 1
+
+                    rows.append({
+                        "Номер документа": res["number"],
+                        "Статус":          res["status"],
+                        "Подробности":     res.get("details", ""),
+                        "Время":           datetime.datetime.now().strftime("%H:%M:%S"),
+                    })
+
+            else:
+                # ── БЕЗ СОРТИРОВКИ ──────────────────────────────────────
+                # Полностью параллельно: создание + add_to_register в одном потоке
+                log.info("  Режим: без сортировки (максимальная скорость)")
+                for future in as_completed(futures):
+                    item = futures[future]
+                    try:
+                        res = future.result()
+                    except Exception as e:
+                        res = {"number": item["number"], "status": "✗ Ошибка",
+                               "details": str(e), "doc_id": None}
+
+                    doc_id = res.get("doc_id")
+                    fp     = item.get("fp") or find_local_file(item["number"])
+
+                    if res["status"] == "✓ Создан" and doc_id:
+                        ts_main = _get_thread_session()
+                        if add_to_register(ts_main, reg_id, doc_id):
+                            log.info("  [%s] ✓ Id=%s", res["number"], doc_id)
+                            res["status"]  = "✓ Успешно"
+                            res["details"] = f"Id={doc_id}, файл={fp.name if fp else ''}"
+                            ok += 1
+                        else:
+                            res["status"]  = "✗ Ошибка"
+                            res["details"] = f"Создан Id={doc_id}, не добавлен в реестр"
+                            fail += 1
+                    elif res["status"] == "— Пропущен": skip += 1
+                    elif res["status"] == "✓ Успешно":  ok   += 1
+                    else:                                fail += 1
+
+                    rows.append({
+                        "Номер документа": res["number"],
+                        "Статус":          res["status"],
+                        "Подробности":     res.get("details", ""),
+                        "Время":           datetime.datetime.now().strftime("%H:%M:%S"),
+                    })
+
+    elapsed = str(datetime.datetime.now() - start_ts).split(".")[0]
+    log.info("=" * 60)
+    log.info("Готово за %s.  ✓ %d   ✗ %d   — %d", elapsed, ok, fail, skip)
+    log.info("=" * 60)
+
+    save_report(rows, oper_name, start_ts, reg_code)
+
+
+if __name__ == "__main__":
+    # Проверка обновлений перед запуском
+    def _check_update() -> None:
+        if not GITHUB_RAW_URL:
+            return
+        try:
+            import urllib.request
+            import re as _re
+
+            print(f"  Версия: {VERSION}  Проверяю обновления...")
+            with urllib.request.urlopen(GITHUB_RAW_URL, timeout=5) as resp:
+                remote = resp.read().decode("utf-8")
+
+            # Читаем версию из удалённого файла
+            m = _re.search(r'^VERSION\s*=\s*["\'](.+?)["\']', remote, _re.M)
+            if not m:
+                return
+            remote_ver = m.group(1)
+
+            if remote_ver == VERSION:
+                print(f"  Версия актуальна ({VERSION})")
+                return
+
+            print(f"  Доступна новая версия: {remote_ver}  (у вас: {VERSION})")
+            ans = input("  Обновить? [Enter = да / n = нет]: ").strip().lower()
+            if ans == "n":
+                return
+
+            # Сохраняем текущий файл как резервную копию
+            import os
+            script = os.path.abspath(__file__)
+            backup = script + f".bak_{VERSION}"
+            with open(script, "rb") as f:
+                with open(backup, "wb") as b:
+                    b.write(f.read())
+
+            # Записываем новую версию
+            with open(script, "w", encoding="utf-8") as f:
+                f.write(remote)
+
+            print(f"  ✓ Обновлено до версии {remote_ver}")
+            print(f"  Резервная копия: {backup}")
+            print(f"  Перезапустите скрипт.")
+            sys.exit(0)
+
+        except Exception as e:
+            print(f"  Не удалось проверить обновления: {e}")
+
+    _check_update()
+    main()
